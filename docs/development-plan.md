@@ -29,7 +29,9 @@
 - [x] 数据库任务队列、`FOR UPDATE SKIP LOCKED`、Lease/Fencing 和 Attempt 接管。
 - [x] Event 单调序号、Checkpoint 单调推进和终态事务。
 - [x] 内存并发测试与真实 PostgreSQL 生命周期集成测试。
-- [ ] Worker 将持久化事件和 Checkpoint 接入 Agent Loop。
+- [x] Worker 完成抢租约、周期续租、Agent Loop 事件持久化、关键边界 Checkpoint 和终态提交。
+- [x] Lease 被接管后取消旧 Engine，拒绝旧 fence 的事件和终态写入。
+- [ ] Engine 执行状态可序列化，并从 Checkpoint 恢复消息、预算和已完成 Tool Call。
 - [ ] SSE `after_seq` 断线续传。
 - [ ] Outbox Publisher 与崩溃注入恢复测试。
 

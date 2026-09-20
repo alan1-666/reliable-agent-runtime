@@ -173,6 +173,32 @@ func TestOnlyOneWorkerCanLeaseQueuedRun(t *testing.T) {
 	}
 }
 
+func TestFinishRejectsMismatchedTerminalEvent(t *testing.T) {
+	repository := NewMemoryRepository()
+	now := time.Unix(100, 0).UTC()
+	mustCreate(t, repository, storeRequest("run-1", "key-1"), now)
+	lease, err := repository.LeaseNext(context.Background(), "worker-a", now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repository.FinishRun(
+		context.Background(), "run-1", "worker-a", lease.FenceToken,
+		domain.FinalResult{Status: domain.RunStatusSucceeded, Output: "done"},
+		domain.EventRunFailed,
+		now.Add(time.Second),
+	)
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("error = %v, want invalid transition", err)
+	}
+	record, err := repository.GetRun(context.Background(), "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != domain.RunStatusRunning {
+		t.Fatalf("status = %s, want RUNNING", record.Status)
+	}
+}
+
 func storeRequest(runID, key string) domain.RunRequest {
 	return domain.RunRequest{
 		RunID:          runID,

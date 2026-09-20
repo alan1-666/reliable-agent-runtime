@@ -280,8 +280,8 @@ func (r *Repository) FinishRun(
 	eventType domain.EventType,
 	now time.Time,
 ) (domain.RunEvent, error) {
-	if !store.IsTerminal(result.Status) {
-		return domain.RunEvent{}, store.ErrInvalidTransition
+	if err := store.ValidateTerminalEvent(result, eventType); err != nil {
+		return domain.RunEvent{}, err
 	}
 	resultJSON, err := json.Marshal(result)
 	if err != nil {

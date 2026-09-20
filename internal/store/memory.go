@@ -208,8 +208,8 @@ func (r *MemoryRepository) FinishRun(
 	eventType domain.EventType,
 	now time.Time,
 ) (domain.RunEvent, error) {
-	if !IsTerminal(result.Status) {
-		return domain.RunEvent{}, ErrInvalidTransition
+	if err := ValidateTerminalEvent(result, eventType); err != nil {
+		return domain.RunEvent{}, err
 	}
 	payload, err := json.Marshal(result)
 	if err != nil {

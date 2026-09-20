@@ -45,6 +45,19 @@ Lifecycle Platform / Business App / CLI
 9. 达成目标、无足够证据、预算耗尽、取消或错误后写入终态。
 10. SSE/gRPC 消费者按 `(run_id, seq)` 获取事件，断线后从最后 seq 续传。
 
+### Worker 执行边界
+
+Worker 只负责一次 Lease 范围内的可靠编排：
+
+1. 从 Repository 获取 Run 和递增后的 fence token；
+2. 根据持久化 Run 重建 Engine 请求，并在后台周期续租；
+3. 忽略 Engine 本地的 `RUN_CREATED`，因为创建事务已经写入该事件；
+4. 普通事件通过 Repository 分配数据库 seq，关键边界同步保存 Checkpoint；
+5. 终态不走普通 Append，而通过 `FinishRun` 原子更新 Run、Attempt、终态 Event 和 Outbox；
+6. 续租或任意持久化出现 `ErrLeaseLost` 时立即取消 Engine，旧 Worker 不再提交结果。
+
+当前 Checkpoint 是持久化进度标记，尚未包含完整对话和工具执行状态，因此只能支持新 Attempt 安全接管，不能从任意模型流片段精确续跑。完整恢复需要 Engine 暴露可序列化执行状态。
+
 ## 3. Agent Loop
 
 逻辑阶段：
@@ -136,7 +149,7 @@ Context 分为 system policy、Manifest assets、conversation、checkpoint summa
 2. Worker 写 Event、Checkpoint 和终态时必须同时匹配 `lease_owner + fence_token + lease_until`，旧 Worker 即使恢复也无法提交。
 3. `last_event_seq` 在锁定 Run 行后递增，Event 与 Outbox 同事务落库；Checkpoint 只能引用已提交的 Event seq，不能倒退或超前。
 
-对应实现见 [`internal/store`](../internal/store) 和 [`migrations`](../migrations)。
+对应实现见 [`internal/store`](../internal/store)、[`internal/worker`](../internal/worker) 和 [`migrations`](../migrations)。
 
 ## 8. API
 

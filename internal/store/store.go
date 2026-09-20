@@ -79,3 +79,28 @@ func IsTerminal(status domain.RunStatus) bool {
 		return false
 	}
 }
+
+func TerminalEventForStatus(status domain.RunStatus) (domain.EventType, bool) {
+	switch status {
+	case domain.RunStatusSucceeded:
+		return domain.EventRunSucceeded, true
+	case domain.RunStatusFailed:
+		return domain.EventRunFailed, true
+	case domain.RunStatusCancelled:
+		return domain.EventRunCancelled, true
+	case domain.RunStatusInconclusive:
+		return domain.EventRunInconclusive, true
+	case domain.RunStatusTimedOut:
+		return domain.EventRunTimedOut, true
+	default:
+		return "", false
+	}
+}
+
+func ValidateTerminalEvent(result domain.FinalResult, eventType domain.EventType) error {
+	want, terminal := TerminalEventForStatus(result.Status)
+	if !terminal || eventType != want {
+		return ErrInvalidTransition
+	}
+	return nil
+}
