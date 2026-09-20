@@ -1,0 +1,9 @@
+BEGIN;
+
+DROP TABLE IF EXISTS outbox_events;
+DROP TABLE IF EXISTS checkpoints;
+DROP TABLE IF EXISTS run_events;
+DROP TABLE IF EXISTS run_attempts;
+DROP TABLE IF EXISTS runs;
+
+COMMIT;
