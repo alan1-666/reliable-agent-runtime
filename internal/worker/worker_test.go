@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"safemarket/agent-runtime/internal/domain"
 	"safemarket/agent-runtime/internal/engine"
+	"safemarket/agent-runtime/internal/model"
 	"safemarket/agent-runtime/internal/model/fake"
 	"safemarket/agent-runtime/internal/store"
+	"safemarket/agent-runtime/internal/tool"
 )
 
 type fixedClock struct{ now time.Time }
@@ -66,19 +69,92 @@ func TestRunOncePersistsEngineEventsCheckpointAndTerminal(t *testing.T) {
 	if checkpoint.EventSequence != 2 {
 		t.Fatalf("checkpoint sequence = %d, want 2", checkpoint.EventSequence)
 	}
-	var state struct {
-		LastEvent domain.EventType `json:"last_event"`
-	}
-	if err := json.Unmarshal(checkpoint.State, &state); err != nil {
+	state, err := engine.DecodeState(checkpoint.State)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if state.LastEvent != domain.EventModelStarted {
-		t.Fatalf("checkpoint last event = %s", state.LastEvent)
+	if state.Phase != engine.PhaseModel || state.Turn != 1 || len(state.Messages) != 1 {
+		t.Fatalf("unexpected checkpoint state: %+v", state)
 	}
 
 	executed, err = worker.RunOnce(context.Background())
 	if err != nil || executed {
 		t.Fatalf("empty queue: executed=%v err=%v", executed, err)
+	}
+}
+
+func TestNewAttemptResumesAfterCompletedToolWithoutRepeatingIt(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	memory := store.NewMemoryRepository()
+	request := runRequest("run-resume")
+	if _, _, err := memory.CreateRun(context.Background(), request, now); err != nil {
+		t.Fatal(err)
+	}
+	toolExecutions := 0
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.Function{
+		Def: tool.Definition{
+			Name:        "echo",
+			InputSchema: json.RawMessage(`{"type":"object"}`),
+			ReadOnly:    true,
+		},
+		Run: func(context.Context, json.RawMessage) (tool.Result, error) {
+			toolExecutions++
+			return tool.Result{Content: `{"ok":true}`}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstAdapter := fake.Scripted(
+		[]model.Event{{Type: model.EventToolCall, ToolCall: model.ToolCall{
+			ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`),
+		}}},
+		[]model.Event{{Type: model.EventCompleted, Output: "should not persist"}},
+	)
+	injected := errors.New("simulated persistence outage")
+	failingRepository := &failModelStartRepository{Repository: memory, failure: injected}
+	firstRuntime := engine.New(firstAdapter, engine.WithTools(registry))
+	firstWorker, err := New(failingRepository, firstRuntime, testConfig("worker-a"), WithClock(fixedClock{now: now}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executed, err := firstWorker.RunOnce(context.Background()); !executed || !errors.Is(err, injected) {
+		t.Fatalf("first attempt: executed=%v err=%v", executed, err)
+	}
+	if toolExecutions != 1 {
+		t.Fatalf("tool executions after first attempt = %d", toolExecutions)
+	}
+	checkpoint, err := memory.GetCheckpoint(context.Background(), request.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := engine.DecodeState(checkpoint.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Phase != engine.PhaseTools || state.NextToolIndex != 1 {
+		t.Fatalf("unexpected recovery state: %+v", state)
+	}
+
+	secondAdapter := fake.Successful("recovered")
+	secondRuntime := engine.New(secondAdapter, engine.WithTools(registry))
+	secondWorker, err := New(memory, secondRuntime, testConfig("worker-b"), WithClock(fixedClock{now: now.Add(2 * time.Minute)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executed, err := secondWorker.RunOnce(context.Background()); !executed || err != nil {
+		t.Fatalf("second attempt: executed=%v err=%v", executed, err)
+	}
+	if toolExecutions != 1 {
+		t.Fatalf("completed tool was repeated: executions=%d", toolExecutions)
+	}
+	requests := secondAdapter.Requests()
+	if len(requests) != 1 || requests[0].Turn != 2 {
+		t.Fatalf("resume model requests: %+v", requests)
+	}
+	record, err := memory.GetRun(context.Background(), request.RunID)
+	if err != nil || record.FinalResult == nil || record.FinalResult.Output != "recovered" || record.Attempt != 2 {
+		t.Fatalf("final record=%+v err=%v", record, err)
 	}
 }
 
@@ -127,6 +203,29 @@ type stealingRepository struct {
 	memory  *store.MemoryRepository
 	stealAt time.Time
 	stolen  bool
+}
+
+type failModelStartRepository struct {
+	store.Repository
+	modelStarts int
+	failure     error
+}
+
+func (repository *failModelStartRepository) AppendEvent(
+	ctx context.Context,
+	runID, workerID string,
+	fence uint64,
+	eventType domain.EventType,
+	payload json.RawMessage,
+	now time.Time,
+) (domain.RunEvent, error) {
+	if eventType == domain.EventModelStarted {
+		repository.modelStarts++
+		if repository.modelStarts == 2 {
+			return domain.RunEvent{}, fmt.Errorf("persist model start: %w", repository.failure)
+		}
+	}
+	return repository.Repository.AppendEvent(ctx, runID, workerID, fence, eventType, payload, now)
 }
 
 func (repository *stealingRepository) AppendEvent(

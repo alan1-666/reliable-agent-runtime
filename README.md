@@ -33,6 +33,9 @@ agent-runtime/
 ├── internal/
 │   ├── run/                 # Run/Attempt 状态机
 │   ├── engine/              # Agent Loop
+│   ├── httpapi/             # Run API 与 SSE
+│   ├── worker/              # Lease、续租和持久化编排
+│   ├── outbox/              # 可靠事件发布与重试
 │   ├── model/               # Model Adapter
 │   ├── context/             # Context 构建和压缩
 │   ├── tool/                # Registry、Scheduler、MCP
@@ -48,7 +51,7 @@ agent-runtime/
 
 ## 当前状态
 
-`PHASE-2 PARTIAL`：已完成 Go 骨架、可替换 Model Adapter、Fake Model、OpenAI-compatible/DeepSeek Adapter、typed event、Model → Tool → Model 循环、Tool Registry、Schema 子集校验和预算/取消传播。持久层已实现内存与 PostgreSQL 两套 Repository，覆盖幂等创建、初始事件与 Outbox 原子提交、`SKIP LOCKED` 抢占、Lease/Fencing、Attempt、单调 Event/Checkpoint 和终态事务。Worker 已接入 Agent Loop，支持周期续租、事件落库、关键边界 Checkpoint、终态提交以及丢失 Lease 后取消旧执行，并通过单元、并发和真实 PostgreSQL 生命周期测试。下一步是实现 Engine 状态恢复、SSE 与 Outbox Publisher。
+`PHASE-2 PARTIAL`：已完成可替换 Model Adapter、Agent Loop、Tool Registry、预算与取消传播，以及 PostgreSQL 幂等任务、Lease/Fencing、Event/Checkpoint 和终态事务。Engine Checkpoint v1 可恢复消息、turn、预算与 Tool 进度；新 Worker 能从安全边界继续，且不会自动重放状态未知的写 Tool。HTTP API 支持创建/查询 Run 和 SSE 续传。Outbox Publisher 已实现租约、token fencing、发布超时和指数退避。下一步是写 Tool 的幂等查询恢复、真实认证和生产消息 Sink。
 
 ```bash
 GOCACHE=/tmp/safemarket-agent-go-cache \
@@ -89,11 +92,40 @@ docker compose up -d --wait
 docker compose exec -T postgres \
   psql -U agent_runtime -d agent_runtime \
   -f /migrations/001_runtime.up.sql
+docker compose exec -T postgres \
+  psql -U agent_runtime -d agent_runtime \
+  -f /migrations/002_outbox_leasing.up.sql
 
 export DEEPSEEK_API_KEY='...'
 go run ./cmd/persistent-demo
 ```
 
 演示会创建唯一 Run，由 Worker 获取 Lease 后执行一次 Tool Calling，并从数据库按 seq 输出完整事件。重复执行 migration 会因表已存在而失败；本地需要重建时再显式执行 down migration。
+
+也可以分别启动 API 和 Worker：
+
+```bash
+# terminal 1
+go run ./cmd/api
+
+# terminal 2
+export DEEPSEEK_API_KEY='...'
+go run ./cmd/worker
+```
+
+创建任务并订阅事件：
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/runs \
+  -H 'Content-Type: application/json' \
+  -H 'X-Tenant-ID: local-demo' \
+  -H 'Idempotency-Key: demo-request-1' \
+  -d '{"input":"Check order-service health","mode":"EVAL","manifest":{"release_id":"demo-v1","checksum":"sha256:demo-v1"}}'
+
+curl -N 'http://127.0.0.1:8080/v1/runs/<run_id>/events?after_seq=0' \
+  -H 'X-Tenant-ID: local-demo'
+```
+
+`X-Tenant-ID` 目前仅用于本地开发；生产环境必须由认证中间件提供可信租户身份。
 
 不要提交 `.env` 或在日志、Trace、Release Manifest 中记录 API Key。模型名和价格可能变化，以 DeepSeek 官方文档和账户控制台为准。

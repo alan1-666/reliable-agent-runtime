@@ -72,6 +72,16 @@ func (r *Registry) Definitions() []Definition {
 	return definitions
 }
 
+func (r *Registry) Definition(name string) (Definition, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	handler, exists := r.handlers[name]
+	if !exists {
+		return Definition{}, false
+	}
+	return handler.Definition(), true
+}
+
 func (r *Registry) Execute(ctx context.Context, name string, arguments json.RawMessage) (Result, error) {
 	r.mu.RLock()
 	handler, exists := r.handlers[name]

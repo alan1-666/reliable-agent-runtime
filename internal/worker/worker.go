@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"safemarket/agent-runtime/internal/domain"
+	runtimeengine "safemarket/agent-runtime/internal/engine"
 	"safemarket/agent-runtime/internal/store"
 )
 
@@ -18,7 +19,7 @@ var (
 )
 
 type Engine interface {
-	Run(context.Context, domain.RunRequest) <-chan domain.RunEvent
+	Execute(context.Context, domain.RunRequest, *runtimeengine.ExecutionState) <-chan runtimeengine.Output
 }
 
 type Clock interface {
@@ -117,8 +118,12 @@ func (w *Worker) executeLease(ctx context.Context, lease store.Lease) error {
 	go w.renewLease(heartbeatCtx, lease, heartbeatErrors)
 
 	request := requestFrom(lease.Run)
-	events := w.engine.Run(runCtx, request)
-	for events != nil {
+	checkpoint, err := w.loadCheckpoint(runCtx, lease.Run.ID)
+	if err != nil {
+		return err
+	}
+	outputs := w.engine.Execute(runCtx, request, checkpoint)
+	for outputs != nil {
 		select {
 		case err := <-heartbeatErrors:
 			cancelRun()
@@ -128,11 +133,12 @@ func (w *Worker) executeLease(ctx context.Context, lease store.Lease) error {
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
-		case event, ok := <-events:
+		case item, ok := <-outputs:
 			if !ok {
-				events = nil
+				outputs = nil
 				continue
 			}
+			event := item.Event
 			if event.Type == domain.EventRunCreated {
 				continue
 			}
@@ -153,8 +159,8 @@ func (w *Worker) executeLease(ctx context.Context, lease store.Lease) error {
 				cancelRun()
 				return err
 			}
-			if shouldCheckpoint(event.Type) {
-				if err := w.saveCheckpoint(runCtx, lease, event, persisted.Sequence); err != nil {
+			if item.Checkpoint != nil {
+				if err := w.saveCheckpoint(runCtx, lease, *item.Checkpoint, persisted.Sequence); err != nil {
 					cancelRun()
 					return err
 				}
@@ -214,18 +220,10 @@ func (w *Worker) finish(ctx context.Context, lease store.Lease, event domain.Run
 func (w *Worker) saveCheckpoint(
 	ctx context.Context,
 	lease store.Lease,
-	event domain.RunEvent,
+	checkpoint runtimeengine.ExecutionState,
 	persistedSequence uint64,
 ) error {
-	state, err := json.Marshal(struct {
-		Attempt        int              `json:"attempt"`
-		EngineSequence uint64           `json:"engine_sequence"`
-		LastEvent      domain.EventType `json:"last_event"`
-	}{
-		Attempt:        lease.Attempt,
-		EngineSequence: event.Sequence,
-		LastEvent:      event.Type,
-	})
+	state, err := runtimeengine.EncodeState(checkpoint)
 	if err != nil {
 		return err
 	}
@@ -236,6 +234,21 @@ func (w *Worker) saveCheckpoint(
 		State:         state,
 		CreatedAt:     w.clock.Now(),
 	})
+}
+
+func (w *Worker) loadCheckpoint(ctx context.Context, runID string) (*runtimeengine.ExecutionState, error) {
+	checkpoint, err := w.repository.GetCheckpoint(ctx, runID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	state, err := runtimeengine.DecodeState(checkpoint.State)
+	if err != nil {
+		return nil, fmt.Errorf("decode checkpoint: %w", err)
+	}
+	return &state, nil
 }
 
 func requestFrom(record store.RunRecord) domain.RunRequest {
@@ -257,19 +270,6 @@ func terminalEvent(eventType domain.EventType) bool {
 		domain.EventRunCancelled,
 		domain.EventRunInconclusive,
 		domain.EventRunTimedOut:
-		return true
-	default:
-		return false
-	}
-}
-
-func shouldCheckpoint(eventType domain.EventType) bool {
-	switch eventType {
-	case domain.EventModelStarted,
-		domain.EventUsageRecorded,
-		domain.EventToolRequested,
-		domain.EventToolCompleted,
-		domain.EventToolFailed:
 		return true
 	default:
 		return false

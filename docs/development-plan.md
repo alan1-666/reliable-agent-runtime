@@ -31,11 +31,18 @@
 - [x] 内存并发测试与真实 PostgreSQL 生命周期集成测试。
 - [x] Worker 完成抢租约、周期续租、Agent Loop 事件持久化、关键边界 Checkpoint 和终态提交。
 - [x] Lease 被接管后取消旧 Engine，拒绝旧 fence 的事件和终态写入。
-- [ ] Engine 执行状态可序列化，并从 Checkpoint 恢复消息、预算和已完成 Tool Call。
-- [ ] SSE `after_seq` 断线续传。
-- [ ] Outbox Publisher 与崩溃注入恢复测试。
+- [x] Engine v1 执行状态可序列化，恢复消息、turn、累计预算、待执行 Tool Calls 和完成下标。
+- [x] 新 Attempt 从模型/工具安全边界继续；已完成只读 Tool 不重复执行。
+- [x] 恢复时拒绝自动重放状态未知的写 Tool，Run 转为 `INCONCLUSIVE`。
+- [ ] 为写 Tool 接入业务幂等键和结果查询，支持从 `UNKNOWN` 安全恢复。
+- [x] HTTP 幂等创建/查询 API 与 SSE `after_seq`、`Last-Event-ID` 断线续传。
+- [ ] 接入真实认证，把开发期 `X-Tenant-ID` 替换为认证上下文中的租户。
+- [x] Outbox Publisher 核心：批量租约、`SKIP LOCKED`、lease token fencing、发布超时和指数退避。
+- [x] 真实 PostgreSQL 验证 Publisher 租约过期接管与旧 Publisher 写入拒绝。
+- [ ] 接入实际消息系统 Sink，并以 Outbox ID 实现消费端去重。
+- [ ] 完成“外部发送成功、MarkPublished 前崩溃”的重复投递演练。
 
-验收：在模型前、工具前、工具后和终态前杀死 Worker，任务均能按设计恢复且不产生双终态。**存储原语和真实数据库集成测试已通过，Worker 恢复链路待接入。**
+验收：在模型前、工具前、工具后和终态前杀死 Worker，任务均能按设计恢复且不产生双终态。**存储原语、Worker 接管、只读 Tool 完成后恢复和真实数据库 fencing 已通过；写 Tool 的幂等查询恢复待实现。**
 
 ## Phase 3：工具治理
 

@@ -14,13 +14,14 @@ import (
 )
 
 var (
-	ErrInvalidRequest = errors.New("invalid run request")
-	ErrMaxTurns       = errors.New("maximum turns exceeded")
-	ErrMaxToolCalls   = errors.New("maximum tool calls exceeded")
-	ErrInputTokens    = errors.New("input token budget exceeded")
-	ErrOutputTokens   = errors.New("output token budget exceeded")
-	ErrCostBudget     = errors.New("cost budget exceeded")
-	ErrEmptyModelTurn = errors.New("model turn ended without final result or tool call")
+	ErrInvalidRequest     = errors.New("invalid run request")
+	ErrMaxTurns           = errors.New("maximum turns exceeded")
+	ErrMaxToolCalls       = errors.New("maximum tool calls exceeded")
+	ErrInputTokens        = errors.New("input token budget exceeded")
+	ErrOutputTokens       = errors.New("output token budget exceeded")
+	ErrCostBudget         = errors.New("cost budget exceeded")
+	ErrEmptyModelTurn     = errors.New("model turn ended without final result or tool call")
+	ErrUnsafeToolRecovery = errors.New("cannot automatically replay a non-read-only tool after recovery")
 )
 
 type Clock interface {
@@ -83,6 +84,18 @@ func NewWithClock(adapter model.Adapter, clock Clock) *Engine {
 
 func (e *Engine) Run(ctx context.Context, request domain.RunRequest) <-chan domain.RunEvent {
 	output := make(chan domain.RunEvent, 32)
+	execution := e.Execute(ctx, request, nil)
+	go func() {
+		defer close(output)
+		for item := range execution {
+			output <- item.Event
+		}
+	}()
+	return output
+}
+
+func (e *Engine) Execute(ctx context.Context, request domain.RunRequest, checkpoint *ExecutionState) <-chan Output {
+	output := make(chan Output, 32)
 	runCtx := ctx
 	cancel := func() {}
 	if !request.Deadline.IsZero() {
@@ -94,39 +107,50 @@ func (e *Engine) Run(ctx context.Context, request domain.RunRequest) <-chan doma
 		defer close(output)
 
 		sequence := uint64(0)
-		emit := func(eventType domain.EventType, payload any) bool {
+		state := InitialState(request)
+		resumed := checkpoint != nil
+		if resumed {
+			state = cloneState(*checkpoint)
+		}
+		emit := func(eventType domain.EventType, payload any, checkpointState *ExecutionState) bool {
 			sequence++
 			encoded, _ := json.Marshal(payload)
-			event := domain.RunEvent{
-				RunID:      request.RunID,
-				Sequence:   sequence,
-				Type:       eventType,
-				OccurredAt: e.clock.Now(),
-				Payload:    encoded,
+			item := Output{
+				Event: domain.RunEvent{
+					RunID:      request.RunID,
+					Sequence:   sequence,
+					Type:       eventType,
+					OccurredAt: e.clock.Now(),
+					Payload:    encoded,
+				},
+			}
+			if checkpointState != nil {
+				cloned := cloneState(*checkpointState)
+				item.Checkpoint = &cloned
 			}
 			select {
 			case <-runCtx.Done():
 				return false
-			case output <- event:
+			case output <- item:
 				return true
 			}
 		}
 		emitTerminal := func(eventType domain.EventType, payload any) {
 			sequence++
 			encoded, _ := json.Marshal(payload)
-			output <- domain.RunEvent{
-				RunID:      request.RunID,
-				Sequence:   sequence,
-				Type:       eventType,
-				OccurredAt: e.clock.Now(),
-				Payload:    encoded,
-			}
+			output <- Output{Event: domain.RunEvent{
+				RunID: request.RunID, Sequence: sequence, Type: eventType,
+				OccurredAt: e.clock.Now(), Payload: encoded,
+			}}
+		}
+		plainEmit := func(eventType domain.EventType, payload any) bool {
+			return emit(eventType, payload, nil)
 		}
 		fail := func(err error) {
-			emit(domain.EventRunFailed, domain.FinalResult{Status: domain.RunStatusFailed, Error: err.Error()})
+			plainEmit(domain.EventRunFailed, domain.FinalResult{Status: domain.RunStatusFailed, Error: err.Error()})
 		}
 		inconclusive := func(err error) {
-			emit(domain.EventRunInconclusive, domain.FinalResult{Status: domain.RunStatusInconclusive, Error: err.Error()})
+			plainEmit(domain.EventRunInconclusive, domain.FinalResult{Status: domain.RunStatusInconclusive, Error: err.Error()})
 		}
 		terminateContext := func(err error) {
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -145,32 +169,50 @@ func (e *Engine) Run(ctx context.Context, request domain.RunRequest) <-chan doma
 			fail(ErrInvalidRequest)
 			return
 		}
+		if err := validateState(state, request); err != nil {
+			fail(err)
+			return
+		}
 		if err := runCtx.Err(); err != nil {
 			terminateContext(err)
 			return
 		}
 
-		if !emit(domain.EventRunCreated, map[string]string{
-			"release_id": request.Manifest.ReleaseID,
-			"mode":       string(request.Mode),
-		}) {
-			return
-		}
-
-		messages := []model.Message{{Role: "user", Content: request.Input}}
-		toolDefinitions := toModelToolDefinitions(e.tools.Definitions())
-		toolCallsUsed := 0
-		usage := model.Usage{}
-
-		for turn := 1; turn <= e.limits.MaxTurns; turn++ {
-			if !emit(domain.EventModelStarted, map[string]any{
-				"adapter": e.model.Name(),
-				"turn":    turn,
+		if !resumed {
+			if !plainEmit(domain.EventRunCreated, map[string]string{
+				"release_id": request.Manifest.ReleaseID,
+				"mode":       string(request.Mode),
 			}) {
 				return
 			}
+		}
 
-			result, err := e.runModelTurn(runCtx, request.RunID, turn, messages, toolDefinitions, emit)
+		toolDefinitions := toModelToolDefinitions(e.tools.Definitions())
+		recoveringTools := resumed && state.Phase == PhaseTools
+		for {
+			if state.Phase == PhaseTools {
+				if !e.executePendingTools(runCtx, &state, recoveringTools, emit, terminateContext, fail, inconclusive) {
+					return
+				}
+				recoveringTools = false
+				state.Phase = PhaseModel
+				state.PendingToolCalls = nil
+				state.NextToolIndex = 0
+				state.Turn++
+				continue
+			}
+			if state.Turn > e.limits.MaxTurns {
+				fail(ErrMaxTurns)
+				return
+			}
+			if !emit(domain.EventModelStarted, map[string]any{
+				"adapter": e.model.Name(),
+				"turn":    state.Turn,
+			}, &state) {
+				return
+			}
+
+			result, err := e.runModelTurn(runCtx, request.RunID, state.Turn, state.Messages, toolDefinitions, plainEmit)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					terminateContext(err)
@@ -179,27 +221,27 @@ func (e *Engine) Run(ctx context.Context, request domain.RunRequest) <-chan doma
 				}
 				return
 			}
-			usage.InputTokens += result.usage.InputTokens
-			usage.OutputTokens += result.usage.OutputTokens
-			usage.CostMicros += result.usage.CostMicros
+			state.Usage.InputTokens += result.usage.InputTokens
+			state.Usage.OutputTokens += result.usage.OutputTokens
+			state.Usage.CostMicros += result.usage.CostMicros
 			if result.usage != (model.Usage{}) {
 				if !emit(domain.EventUsageRecorded, map[string]any{
-					"turn":          turn,
+					"turn":          state.Turn,
 					"input_tokens":  result.usage.InputTokens,
 					"output_tokens": result.usage.OutputTokens,
 					"cost_micros":   result.usage.CostMicros,
-					"total":         usage,
-				}) {
+					"total":         state.Usage,
+				}, &state) {
 					return
 				}
 			}
-			if budgetErr := exceededBudget(e.limits, usage); budgetErr != nil {
+			if budgetErr := exceededBudget(e.limits, state.Usage); budgetErr != nil {
 				inconclusive(budgetErr)
 				return
 			}
 
 			if result.finalOutput != nil {
-				emit(domain.EventRunSucceeded, domain.FinalResult{Status: domain.RunStatusSucceeded, Output: *result.finalOutput})
+				plainEmit(domain.EventRunSucceeded, domain.FinalResult{Status: domain.RunStatusSucceeded, Output: *result.finalOutput})
 				return
 			}
 			if len(result.toolCalls) == 0 {
@@ -207,61 +249,73 @@ func (e *Engine) Run(ctx context.Context, request domain.RunRequest) <-chan doma
 				return
 			}
 
-			if toolCallsUsed+len(result.toolCalls) > e.limits.MaxToolCalls {
+			if state.ToolCallsUsed+len(result.toolCalls) > e.limits.MaxToolCalls {
 				fail(ErrMaxToolCalls)
 				return
 			}
-			toolCallsUsed += len(result.toolCalls)
-			messages = append(messages, model.Message{
+			state.ToolCallsUsed += len(result.toolCalls)
+			state.Messages = append(state.Messages, model.Message{
 				Role:      "assistant",
 				Content:   result.assistantText,
 				ToolCalls: result.toolCalls,
 			})
-
-			for _, call := range result.toolCalls {
-				if !emit(domain.EventToolRequested, map[string]any{
-					"tool_call_id": call.ID,
-					"name":         call.Name,
-					"arguments":    json.RawMessage(call.Arguments),
-				}) {
-					return
-				}
-
-				toolResult, executeErr := e.tools.Execute(runCtx, call.Name, call.Arguments)
-				if executeErr != nil {
-					if runCtx.Err() != nil {
-						terminateContext(runCtx.Err())
-						return
-					}
-					emit(domain.EventToolFailed, map[string]string{
-						"tool_call_id": call.ID,
-						"name":         call.Name,
-						"error":        executeErr.Error(),
-					})
-					fail(fmt.Errorf("execute tool %s: %w", call.Name, executeErr))
-					return
-				}
-
-				if !emit(domain.EventToolCompleted, map[string]string{
-					"tool_call_id": call.ID,
-					"name":         call.Name,
-					"content":      toolResult.Content,
-				}) {
-					return
-				}
-				messages = append(messages, model.Message{
-					Role:       "tool",
-					Content:    toolResult.Content,
-					ToolCallID: call.ID,
-					ToolName:   call.Name,
-				})
-			}
+			state.Phase = PhaseTools
+			state.PendingToolCalls = cloneToolCalls(result.toolCalls)
+			state.NextToolIndex = 0
 		}
-
-		fail(ErrMaxTurns)
 	}()
 
 	return output
+}
+
+func (e *Engine) executePendingTools(
+	ctx context.Context,
+	state *ExecutionState,
+	recovering bool,
+	emit func(domain.EventType, any, *ExecutionState) bool,
+	terminateContext func(error),
+	fail func(error),
+	inconclusive func(error),
+) bool {
+	for state.NextToolIndex < len(state.PendingToolCalls) {
+		call := state.PendingToolCalls[state.NextToolIndex]
+		if recovering {
+			definition, exists := e.tools.Definition(call.Name)
+			if !exists || !definition.ReadOnly {
+				inconclusive(fmt.Errorf("%w: %s", ErrUnsafeToolRecovery, call.Name))
+				return false
+			}
+		}
+		if !emit(domain.EventToolRequested, map[string]any{
+			"tool_call_id": call.ID,
+			"name":         call.Name,
+			"arguments":    json.RawMessage(call.Arguments),
+		}, state) {
+			return false
+		}
+		toolResult, err := e.tools.Execute(ctx, call.Name, call.Arguments)
+		if err != nil {
+			if ctx.Err() != nil {
+				terminateContext(ctx.Err())
+				return false
+			}
+			emit(domain.EventToolFailed, map[string]string{
+				"tool_call_id": call.ID, "name": call.Name, "error": err.Error(),
+			}, nil)
+			fail(fmt.Errorf("execute tool %s: %w", call.Name, err))
+			return false
+		}
+		state.Messages = append(state.Messages, model.Message{
+			Role: "tool", Content: toolResult.Content, ToolCallID: call.ID, ToolName: call.Name,
+		})
+		state.NextToolIndex++
+		if !emit(domain.EventToolCompleted, map[string]string{
+			"tool_call_id": call.ID, "name": call.Name, "content": toolResult.Content,
+		}, state) {
+			return false
+		}
+	}
+	return true
 }
 
 type turnResult struct {

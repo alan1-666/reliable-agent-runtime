@@ -14,17 +14,17 @@ const (
 )
 
 type Message struct {
-	Role       string
-	Content    string
-	ToolCallID string
-	ToolName   string
-	ToolCalls  []ToolCall
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolName   string     `json:"tool_name,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type ToolCall struct {
-	ID        string
-	Name      string
-	Arguments json.RawMessage
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 type ToolDefinition struct {

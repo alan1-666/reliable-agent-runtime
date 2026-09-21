@@ -56,7 +56,9 @@ Worker 只负责一次 Lease 范围内的可靠编排：
 5. 终态不走普通 Append，而通过 `FinishRun` 原子更新 Run、Attempt、终态 Event 和 Outbox；
 6. 续租或任意持久化出现 `ErrLeaseLost` 时立即取消 Engine，旧 Worker 不再提交结果。
 
-当前 Checkpoint 是持久化进度标记，尚未包含完整对话和工具执行状态，因此只能支持新 Attempt 安全接管，不能从任意模型流片段精确续跑。完整恢复需要 Engine 暴露可序列化执行状态。
+Checkpoint v1 保存 `run_id、manifest_checksum、phase、turn、messages、usage、tool_calls_used、pending_tool_calls、next_tool_index`。新 Attempt 会校验版本、Run 和 Manifest 后恢复：模型调用前的崩溃会重新调用模型；Tool 完成后的崩溃从下一个 Tool 或下一轮模型继续，不重复已经持久化完成的 Tool。
+
+模型流式响应本身不做 token 级续传，供应商成功但 Checkpoint 未落库时可能重复模型调用并产生额外成本。只读 Tool 可以安全重放；写 Tool 在回包未知窗口内不允许自动重放，恢复时进入 `INCONCLUSIVE`。后续必须依赖业务幂等键和结果查询把 `UNKNOWN` 收敛成成功或可重试。
 
 ## 3. Agent Loop
 
@@ -151,6 +153,12 @@ Context 分为 system policy、Manifest assets、conversation、checkpoint summa
 
 对应实现见 [`internal/store`](../internal/store)、[`internal/worker`](../internal/worker) 和 [`migrations`](../migrations)。
 
+### Outbox 投递语义
+
+Publisher 使用 `FOR UPDATE SKIP LOCKED` 批量获取到期消息，并写入 `lease_owner + lease_until + lease_token`。租约过期后其他 Publisher 可以接管，旧 Publisher 的成功或重试回写会因 token 过期被拒绝。单次 Sink 调用受独立超时限制，失败后按有上限的指数退避重新调度。
+
+Outbox 提供的是至少一次投递：如果 Sink 已发送成功，而进程在 `MarkPublished` 前崩溃，消息会在租约过期后再次发送。这不是数据库能够消除的窗口，因此消息携带稳定 Outbox ID，生产 Sink 和消费者必须用该 ID 去重；不能在简历或设计中声称端到端 exactly-once。
+
 ## 8. API
 
 - `POST /v1/runs`：幂等创建 Run。
@@ -160,6 +168,8 @@ Context 分为 system policy、Manifest assets、conversation、checkpoint summa
 - `POST /v1/runs/{id}/approvals/{approval_id}`：批准或拒绝。
 - `GET /v1/runs/{id}/trace`：脱敏 Trace。
 - `POST /v1/runs/{id}/replay`：基于固定快照重放，仅允许 EVAL/REPLAY。
+
+当前已实现前三个接口中的创建、状态查询和事件 SSE。SSE 使用 Event `seq` 作为 `id`，客户端可以通过 `after_seq` 或标准 `Last-Event-ID` 恢复；读接口会先校验租户归属。开发版本暂用 `X-Tenant-ID` 传递租户，生产环境必须由认证中间件写入可信上下文，不能直接信任客户端 Header。
 
 ## 9. 安全
 

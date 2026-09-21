@@ -191,6 +191,73 @@ func TestRunPropagatesCancellation(t *testing.T) {
 	}
 }
 
+func TestResumeExecutesOnlyRemainingReadOnlyTools(t *testing.T) {
+	adapter := fake.Successful("recovered")
+	registry := tool.NewRegistry()
+	executions := 0
+	if err := registry.Register(tool.Function{
+		Def: tool.Definition{Name: "echo", InputSchema: json.RawMessage(`{"type":"object"}`), ReadOnly: true},
+		Run: func(context.Context, json.RawMessage) (tool.Result, error) {
+			executions++
+			return tool.Result{Content: "ok"}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest()
+	state := ExecutionState{
+		Version: StateVersion, RunID: request.RunID, ManifestChecksum: request.Manifest.Checksum,
+		Phase: PhaseTools, Turn: 1, ToolCallsUsed: 2, NextToolIndex: 1,
+		Messages: []model.Message{{Role: "user", Content: request.Input}},
+		PendingToolCalls: []model.ToolCall{
+			{ID: "done", Name: "echo", Arguments: json.RawMessage(`{}`)},
+			{ID: "remaining", Name: "echo", Arguments: json.RawMessage(`{}`)},
+		},
+	}
+	runtime := New(adapter, WithTools(registry))
+	outputs := collectOutputs(runtime.Execute(context.Background(), request, &state))
+	if executions != 1 {
+		t.Fatalf("remaining tool executions = %d, want 1", executions)
+	}
+	if len(outputs) < 4 || outputs[0].Event.Type != domain.EventToolRequested ||
+		outputs[1].Event.Type != domain.EventToolCompleted ||
+		outputs[len(outputs)-1].Event.Type != domain.EventRunSucceeded {
+		t.Fatalf("unexpected output types: %v", outputTypes(outputs))
+	}
+	requests := adapter.Requests()
+	if len(requests) != 1 || requests[0].Turn != 2 {
+		t.Fatalf("model requests = %+v", requests)
+	}
+}
+
+func TestResumeDoesNotReplayWriteTool(t *testing.T) {
+	registry := tool.NewRegistry()
+	executions := 0
+	if err := registry.Register(tool.Function{
+		Def: tool.Definition{Name: "write", InputSchema: json.RawMessage(`{"type":"object"}`), ReadOnly: false},
+		Run: func(context.Context, json.RawMessage) (tool.Result, error) {
+			executions++
+			return tool.Result{}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest()
+	state := ExecutionState{
+		Version: StateVersion, RunID: request.RunID, ManifestChecksum: request.Manifest.Checksum,
+		Phase: PhaseTools, Turn: 1, ToolCallsUsed: 1,
+		Messages:         []model.Message{{Role: "user", Content: request.Input}},
+		PendingToolCalls: []model.ToolCall{{ID: "write-1", Name: "write", Arguments: json.RawMessage(`{}`)}},
+	}
+	outputs := collectOutputs(New(fake.Successful("unused"), WithTools(registry)).Execute(context.Background(), request, &state))
+	if executions != 0 || len(outputs) != 1 || outputs[0].Event.Type != domain.EventRunInconclusive {
+		t.Fatalf("executions=%d output types=%v", executions, outputTypes(outputs))
+	}
+	if !strings.Contains(string(outputs[0].Event.Payload), ErrUnsafeToolRecovery.Error()) {
+		t.Fatalf("unexpected payload: %s", outputs[0].Event.Payload)
+	}
+}
+
 func validRequest() domain.RunRequest {
 	return domain.RunRequest{
 		RunID:          "run-1",
@@ -211,6 +278,22 @@ func collect(stream <-chan domain.RunEvent) []domain.RunEvent {
 		events = append(events, event)
 	}
 	return events
+}
+
+func collectOutputs(stream <-chan Output) []Output {
+	var outputs []Output
+	for output := range stream {
+		outputs = append(outputs, output)
+	}
+	return outputs
+}
+
+func outputTypes(outputs []Output) []domain.EventType {
+	result := make([]domain.EventType, 0, len(outputs))
+	for _, output := range outputs {
+		result = append(result, output.Event.Type)
+	}
+	return result
 }
 
 func eventTypes(events []domain.RunEvent) []domain.EventType {
